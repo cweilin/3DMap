@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>deck.gl 3D 城市：真實投影模擬</title>
+    <script src="https://unpkg.com/deck.gl@8.9.0/dist.min.js"></script>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background: #fff; }
+        #app { width: 100vw; height: 100vh; position: relative; }
+        #control-panel {
+            position: absolute; top: 20px; left: 20px; z-index: 1000;
+            background: rgba(255, 255, 255, 0.95); padding: 20px; border-radius: 8px;
+            font-family: sans-serif; box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            width: 250px;
+        }
+        .btn-group { display: flex; flex-direction: column; gap: 8px; }
+        button { padding: 10px; cursor: pointer; border: none; border-radius: 4px; font-weight: bold; }
+        #switch-btn { background: #0078ff; color: white; }
+        #light-btn { background: #555; color: white; }
+        #play-btn { background: #4CAF50; color: white; margin-top: 10px; }
+        .timeline-container { margin-top: 15px; display: none; }
+        #time-slider { width: 100%; cursor: pointer; }
+        .time-display { font-weight: bold; font-size: 14px; color: #333; margin-bottom: 5px; }
+    </style>
+</head>
+<body>
+    <div id="control-panel">
+        <h3 style="margin:0 0 10px 0">deck.gl 開發套件測試</h3>
+        <div class="btn-group">
+            <button id="switch-btn">切換至 3D 模式</button>
+            <button id="light-btn">開啟光影效果：OFF</button>
+        </div>
+        <div id="timeline" class="timeline-container">
+            <div class="time-display">目前時間: <span id="current-time">12:00</span></div>
+            <input type="range" id="time-slider" min="6" max="18" step="0.1" value="9">
+            <button id="play-btn">自動播放</button>
+        </div>
+    </div>
+    <div id="app"></div>
+
+    <script type="text/javascript">
+        const MAPBOX_TOKEN = 'pk.eyJ1Ijoid2F5bmUtZ2Vvc2Vuc2UiLCJhIjoiY21rMjZ2ZHdhMGRrbTNpcGVkNGRyOHZ2OSJ9.EByER_1_VGb4_OlxdpBnnw';
+
+        window.onload = () => {
+            const { DeckGL, MVTLayer, TileLayer, BitmapLayer, PolygonLayer, FlyToInterpolator, LightingEffect, AmbientLight, DirectionalLight } = deck;
+
+            let is3D = false;
+            let useLighting = false;
+            let isPlaying = false;
+            let timer = null;
+            let vState = { longitude: 120.61026, latitude: 24.11091, zoom: 16, pitch: 0, bearing: 0 };
+
+            // 1. 設定光影與陰影
+            const ambientLight = new AmbientLight({ color: [255, 255, 255], intensity: 0.8 });
+            
+            function getSunDirection(hour) {
+                const angle = (hour - 12) * (Math.PI / 12);
+                return [Math.sin(angle), 1, -Math.cos(angle)]; // X, Y, Z 方向
+            }
+
+            function getLayers(show3D, hour) {
+                return [
+                    // 底圖層
+                    new TileLayer({
+                        id: 'osm-tiles',
+                        data: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                        renderSubLayers: props => new BitmapLayer(props, {
+                            data: null, image: props.data,
+                            bounds: [props.tile.bbox.west, props.tile.bbox.south, props.tile.bbox.east, props.tile.bbox.north]
+                        })
+                    }),
+                    // 重要：陰影接收層 (透明平面)
+                    // 只有在這個平面上，建築物的影子才會顯現
+                    new PolygonLayer({
+                        id: 'shadow-catcher',
+                        data: [{contour: [[121.5, 25.0], [121.6, 25.0], [121.6, 25.1], [121.5, 25.1]]}],
+                        getPolygon: d => d.contour,
+                        getFillColor: [255, 255, 255, 1], // 幾乎透明，但存在以接收陰影
+                        parameters: { depthTest: true },
+                        visible: show3D && useLighting
+                    }),
+                    // 3D 建物
+                    new MVTLayer({
+                        id: 'buildings',
+                        data: `https://a.tiles.mapbox.com/v4/mapbox.mapbox-streets-v8/{z}/{x}/{y}.vector.pbf?access_token=${MAPBOX_TOKEN}`,
+                        pickable: true,
+                        autoHighlight: true,
+                        highlightColor: [255, 255, 0, 150],
+                        idProperty: 'id',
+                        binary: false,
+                        extruded: show3D,
+                        getElevation: f => {
+                        const h = f.properties.render_height || f.properties.height || 0;
+                        return h > 0 ? h : 0;
+                        },
+                        getFillColor: f => {
+                        const h = f.properties.render_height || f.properties.height || 0;
+                        return h > 0 ? [180, 180, 180, 255] : [0, 0, 0, 0];
+                        },
+                        wireframe: true,               // 1. 啟用網格線模式
+                        lineWidthMinPixels: 1,         // 2. 設定線條最小像素，確保縮放時線條清晰
+                        getLineColor: f => {
+                        const h = f.properties.render_height || f.properties.height || 0;
+                        return h > 0 ? [100, 100, 100, 255] : [0, 0, 0, 0];
+                        },
+                        material: { ambient: 0.2, diffuse: 0.8, shininess: 32 },
+                        shadowEnabled: true // 開啟圖層陰影
+                    })
+                ];
+            }
+
+            const deckInstance = new DeckGL({
+                container: 'app',
+                viewState: vState,
+                controller: true,
+                onViewStateChange: ({viewState}) => {
+                    vState = viewState;
+                    deckInstance.setProps({viewState: vState});
+                },
+                getTooltip: ({object}) => {
+                    if (!object) return null;
+                    const p = object.properties;
+                    return `建築: ${p.name || '未命名'}\n高度: ${Math.round(p.render_height || p.height || 0)}m`;
+                },
+
+                layers: getLayers(false, 9)
+            });
+
+            function updateSun(hour) {
+                const hourInt = Math.floor(hour);
+                const minInt = Math.floor((hour % 1) * 60);
+                document.getElementById('current-time').innerText = `${hourInt.toString().padStart(2, '0')}:${minInt.toString().padStart(2, '0')}`;
+                
+                if (useLighting) {
+                    const directionalLight = new DirectionalLight({
+                        color: [255, 255, 255],
+                        intensity: 2.0,
+                        direction: getSunDirection(hour),
+                        _shadow: true // 必須開啟此私有參數以啟用陰影映射
+                    });
+                    deckInstance.setProps({
+                        effects: [new LightingEffect({ ambientLight, directionalLight })],
+                        layers: getLayers(is3D, hour)
+                    });
+                }
+            }
+
+            document.getElementById('switch-btn').onclick = () => {
+                is3D = !is3D;
+                document.getElementById('switch-btn').innerText = is3D ? '切換至 2D 模式' : '切換至 3D 模式';
+                deckInstance.setProps({
+                    viewState: { ...vState, pitch: is3D ? 60 : 0,    // 垂直傾斜
+        bearing: is3D ? 30 : 0,  // 水平旋轉 (這就是讓它看起來像「多向旋轉」的關鍵)
+        zoom: is3D ? 16.3 : 16,  // 同時調整縮放，模擬 Dolly Zoom
+        
+        transitionDuration: 1500,
+        transitionInterpolator: new FlyToInterpolator() },
+                    layers: getLayers(is3D, parseFloat(document.getElementById('time-slider').value))
+                });
+            };
+
+            document.getElementById('light-btn').onclick = () => {
+                useLighting = !useLighting;
+                document.getElementById('light-btn').innerText = `開啟投影效果：${useLighting ? 'ON' : 'OFF'}`;
+                document.getElementById('timeline').style.display = useLighting ? 'block' : 'none';
+                if (useLighting) updateSun(parseFloat(document.getElementById('time-slider').value));
+                else deckInstance.setProps({ effects: [], layers: getLayers(is3D, 12) });
+            };
+
+            document.getElementById('time-slider').oninput = (e) => updateSun(parseFloat(e.target.value));
+
+            document.getElementById('play-btn').onclick = () => {
+                if (isPlaying) {
+                    clearInterval(timer);
+                    isPlaying = false;
+                    document.getElementById('play-btn').innerText = '自動播放';
+                } else {
+                    isPlaying = true;
+                    document.getElementById('play-btn').innerText = '停止';
+                    timer = setInterval(() => {
+                        let val = parseFloat(document.getElementById('time-slider').value);
+                        val = val >= 18 ? 6 : val + 0.1;
+                        document.getElementById('time-slider').value = val;
+                        updateSun(val);
+                    }, 100);
+                }
+            };
+        };
+    </script>
+</body>
+</html>
